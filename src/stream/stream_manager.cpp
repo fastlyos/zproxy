@@ -23,97 +23,12 @@
 #include <cstdio>
 #include <thread>
 #include "../handlers/https_manager.h"
-#include "../util/network.h"
 #include "stream_data_logger.h"
 
 #ifdef ON_FLY_COMRESSION
 #include "../handlers/compression.h"
 #endif
 
-#if HELLO_WORLD_SERVER
-void StreamManager::HandleEvent(int fd, EVENT_TYPE event_type,
-                                EVENT_GROUP event_group) {
-  switch (event_type) {
-    case READ_ONESHOT: {
-      HttpStream* stream = streams_set[fd];
-      if (stream == nullptr) {
-        stream = new HttpStream();
-        stream->client_connection.setFileDescriptor(fd);
-        streams_set[fd] = stream;
-      }
-      auto connection = stream->getConnection(fd);
-      connection->read();
-      connection->buffer_size = 1;  // reset buffer size to avoid buffer
-                                    // overflow due to not consuming buffer
-                                    // data.
-      updateFd(fd, EVENT_TYPE::WRITE, EVENT_GROUP::CLIENT);
-      break;
-    }
-
-    case READ: {
-      HttpStream* stream = streams_set[fd];
-      if (stream == nullptr) {
-        stream = new HttpStream();
-        stream->client_connection.setFileDescriptor(fd);
-        streams_set[fd] = stream;
-      }
-      auto connection = stream->getConnection(fd);
-      connection->read();
-      connection->buffer_size = 1;
-      updateFd(fd, EVENT_TYPE::WRITE, EVENT_GROUP::CLIENT);
-    }
-
-    case WRITE: {
-      auto stream = streams_set[fd];
-      if (stream == nullptr) {
-        Logger::LogInfo("Connection closed prematurely" + std::to_string(fd));
-        return;
-      }
-      auto io_result = stream->client_connection.write(this->e200.c_str(),
-                                                       this->e200.length());
-      switch (io_result) {
-        case IO::ERROR:
-        case IO::FD_CLOSED:
-        case IO::FULL_BUFFER:
-          Logger::LogInfo("Something happend sentid e200", LOG_DEBUG);
-          break;
-        case IO::SUCCESS:
-        case IO::DONE_TRY_AGAIN:
-          updateFd(fd, READ, EVENT_GROUP::CLIENT);
-          break;
-      }
-
-      break;
-    }
-    case CONNECT: {
-      int new_fd;
-      //      do {
-      new_fd = listener_connection.doAccept();
-      if (new_fd > 0) {
-        addStream(new_fd);
-      }
-      //      } while (new_fd > 0);
-      return;
-    }
-    case ACCEPT:
-      break;
-    case DISCONNECT: {
-      auto stream = streams_set[fd];
-      if (stream == nullptr) {
-        Logger::LogInfo("Stream doesn't exist for " + std::to_string(fd));
-        deleteFd(fd);
-        ::close(fd);
-        return;
-      }
-      /*      streams_set.erase(fd);
-      delete stream*/
-      ;
-      clearStream(stream);
-      break;
-    }
-  }
-}
-#else
 void StreamManager::HandleEvent(int fd, EVENT_TYPE event_type,
                                 EVENT_GROUP event_group) {
   switch (event_type) {
@@ -258,7 +173,6 @@ void StreamManager::HandleEvent(int fd, EVENT_TYPE event_type,
       ::close(fd);
   }
 }
-#endif
 
 void StreamManager::stop() {
   is_running = false;
@@ -380,33 +294,14 @@ void StreamManager::onRequestEvent(int fd) {
     ::close(fd);
     return;
   }
-
+  std::string extra_log;
+  const char * dd =  extra_log.data();
+  ScopeExit logStream{
+      [stream, dd] { stream->dumpDebugData("OnRequest",dd); }};
   auto& listener_config_ = *stream->service_manager->listener_config_;
   // update log info
   StreamDataLogger logger(stream, listener_config_);
   DEBUG_COUNTER_HIT(debug__::on_request);
-  if (stream->hasStatus(STREAM_STATUS::REQUEST_PENDING)) {
-    stream->dumpDebugData("Request pending");
-    //    Logger::logmsg(
-    //        LOG_DEBUG, "Request pending: [%s] %s -> %s [%s (%d) <- %s (%d)]",
-    //        static_cast<Service*>(stream->request.getService())->name.c_str(),
-    //        stream->response.http_message_str.data(),
-    //        stream->request.http_message_str.data(),
-    //        stream->client_connection.getPeerAddress().c_str(),
-    //        stream->client_connection.getFileDescriptor(),
-    //        stream->backend_connection.getBackend()->address.c_str(),
-    //        stream->backend_connection.getFileDescriptor());
-    stream->status |= helper::to_underlying(STREAM_STATUS::CL_READ_PENDING);
-    stream->client_connection.disableEvents();
-    stream->backend_connection.enableWriteEvent();
-    return;
-  }
-#if PRINT_DEBUG_FLOW_BUFFERS
-  Logger::logmsg(
-      LOG_REMOVE, "IN buffer size: %8lu\tContent-length: %lu\tleft: %lu",
-      stream->client_connection.buffer_size, stream->request.content_length,
-      stream->request.message_bytes_left);
-#endif
   IO::IO_RESULT result = IO::IO_RESULT::ERROR;
   if (stream->service_manager->is_https_listener) {
     result =
@@ -414,7 +309,7 @@ void StreamManager::onRequestEvent(int fd) {
   } else {
     result = stream->client_connection.read();
   }
-
+  extra_log = IO::getResultString(result);
   switch (result) {
     case IO::IO_RESULT::SSL_HANDSHAKE_ERROR:
     case IO::IO_RESULT::SSL_NEED_HANDSHAKE: {
@@ -433,6 +328,8 @@ void StreamManager::onRequestEvent(int fd) {
         httpsHeaders(stream, listener_config_.clnt_check);
         stream->backend_connection.server_name =
             stream->client_connection.server_name;
+        onRequestEvent(fd);
+        return;
       } else if ((ERR_GET_REASON(ERR_peek_error()) == SSL_R_HTTP_REQUEST) &&
                  (ERR_GET_LIB(ERR_peek_error()) == ERR_LIB_SSL)) {
         /* the client speaks plain HTTP on our HTTPS port */
@@ -464,20 +361,13 @@ void StreamManager::onRequestEvent(int fd) {
     }
     case IO::IO_RESULT::SUCCESS:
     case IO::IO_RESULT::DONE_TRY_AGAIN:
-    case IO::IO_RESULT::ZERO_DATA:
-      if (stream->client_connection.buffer_size == 0) {
-        stream->client_connection.enableReadEvent();
-        return;
-      }
+    case IO::IO_RESULT::ZERO_DATA:     
       break;
     case IO::IO_RESULT::FULL_BUFFER:
-      if (stream->client_connection.buffer_size > 0)
-        break;
-      else
-        return;
+      stream->status |= helper::to_underlying(STREAM_STATUS::CL_READ_PENDING);
+      break;
     case IO::IO_RESULT::FD_CLOSED:
-      onClientDisconnect(stream);
-      return;
+      break;
     case IO::IO_RESULT::ERROR:
     case IO::IO_RESULT::CANCELLED:
     default: {
@@ -488,6 +378,10 @@ void StreamManager::onRequestEvent(int fd) {
   }
 
   DEBUG_COUNTER_HIT(debug__::on_request);
+  if (stream->client_connection.buffer_size == 0) {
+    stream->client_connection.enableReadEvent();
+    return;
+  }
   this->stopTimeOut(stream->client_connection.getFileDescriptor());
   stream->clearStatus(STREAM_STATUS::CL_READ_PENDING);
   if (stream->hasOption(STREAM_OPTION::PINNED_CONNECTION) || stream->request.hasPendingData()) {
@@ -529,7 +423,7 @@ void StreamManager::onRequestEvent(int fd) {
   http_parser::PARSE_RESULT parse_result;
   // do {
   parse_result = stream->request.parseRequest(
-      stream->client_connection.buffer, stream->client_connection.buffer_size,
+      stream->client_connection.buffer + stream->client_connection.buffer_offset, stream->client_connection.buffer_size,
       &parsed);  // parsing http data as response structured
 
   switch (parse_result) {
@@ -557,6 +451,8 @@ void StreamManager::onRequestEvent(int fd) {
       return;
     case http_parser::PARSE_RESULT::INCOMPLETE:
       Logger::LogInfo("Parser INCOMPLETE", LOG_DEBUG);
+      stream->dumpDebugData("PARSER INCOMPLETE",
+                            stream->client_connection.buffer);
       return;
   }
 
@@ -663,9 +559,6 @@ void StreamManager::onRequestEvent(int fd) {
   static size_t total_request;
   total_request++;
   stream->response.reset_parser();
-  stream->backend_connection.buffer_offset = 0;
-  stream->client_connection.buffer_offset = 0;
-  stream->backend_connection.buffer_size = 0;
   switch (bck->backend_type) {
     case BACKEND_TYPE::REMOTE: {
       bool need_new_backend = true;
@@ -772,7 +665,7 @@ void StreamManager::onRequestEvent(int fd) {
         stream->options |= helper::to_underlying(STREAM_OPTION::PINNED_CONNECTION);
       }
       stream->backend_connection.enableWriteEvent();
-      return;
+      break;
     }
 
     case BACKEND_TYPE::EMERGENCY_SERVER:
@@ -790,7 +683,7 @@ void StreamManager::onRequestEvent(int fd) {
     case BACKEND_TYPE::CACHE_SYSTEM:
       break;
   }
-  //stream->client_connection.enableReadEvent();
+  stream->client_connection.enableReadEvent();
 }
 
 void StreamManager::onResponseEvent(int fd) {
@@ -800,6 +693,10 @@ void StreamManager::onResponseEvent(int fd) {
     ::close(fd);
     return;
   }
+  std::string extra_log;
+  ScopeExit logStream{[stream, &extra_log] {
+    stream->dumpDebugData("OnResponse", extra_log.data());
+  }};
   auto& listener_config_ = *stream->service_manager->listener_config_;
   // update log info
   StreamDataLogger logger(stream, listener_config_);
@@ -811,19 +708,13 @@ void StreamManager::onResponseEvent(int fd) {
     //                   stream->client_connection.buffer_size,
     //                   stream->request.content_length,
     //                   stream->request.message_bytes_left);
-    stream->dumpDebugData("Response pending");
+    stream->dumpDebugData("Response pending", "PENDING");
     stream->status |= helper::to_underlying(STREAM_STATUS::BCK_READ_PENDING);
     stream->client_connection.enableWriteEvent();
     stream->backend_connection.disableEvents();
     return;
   }
-  stream->dumpDebugData("ON_RESPONSE");
-  if (UNLIKELY(stream->client_connection.isCancelled() ||
-               stream->backend_connection
-                   .isCancelled())) {  // check if client is still active
-    clearStream(stream);
-    return;
-  }
+//  stream->dumpDebugData("ON_RESPONSE");
 #if PRINT_DEBUG_FLOW_BUFFERS
   auto buffer_size_in = stream->backend_connection.buffer_size;
   if (stream->backend_connection.buffer_size != 0)
@@ -840,20 +731,14 @@ void StreamManager::onResponseEvent(int fd) {
             ? "TRUE"
             : "false");
 #endif
-  // disable response timeout timerfd
-#if USE_TIMER_FD_TIMEOUT
-  if (stream->backend_connection.getBackend()->response_timeout > 0) {
-    stream->timer_fd.unset();
-    events::EpollManager::deleteFd(stream->timer_fd.getFileDescriptor());
-  }
-#else
-  this->stopTimeOut(fd);
-#endif
+
 
   DEBUG_COUNTER_HIT(debug__::on_response);
   IO::IO_RESULT result;
 
   if (stream->backend_connection.getBackend()->isHttps()) {
+    char dum_buff[50];
+//    auto res = ::SSL_peek_ex()
     result =
         ssl::SSLConnectionManager::handleDataRead(stream->backend_connection);
   } else {
@@ -902,6 +787,7 @@ void StreamManager::onResponseEvent(int fd) {
       stream->response.getHeaderSent() ? "true" : "false",
       stream->response.chunk_size_left, IO::getResultString(result).data());
 #endif
+  extra_log = IO::getResultString(result);
   switch (result) {
     case IO::IO_RESULT::SSL_HANDSHAKE_ERROR:
     case IO::IO_RESULT::SSL_NEED_HANDSHAKE: {
@@ -932,12 +818,10 @@ void StreamManager::onResponseEvent(int fd) {
       }
       break;
     }
-    case IO::IO_RESULT::FULL_BUFFER:
-      if (stream->backend_connection.buffer_size > 0)
-        break;
-      else
-        return;
+    case IO::IO_RESULT::FULL_BUFFER:    
+        break;  
     case IO::IO_RESULT::FD_CLOSED:
+      if(!stream->backend_connection.ssl_connected)
       onServerDisconnect(stream);
       return;
     case IO::IO_RESULT::ERROR:
@@ -973,7 +857,12 @@ void StreamManager::onResponseEvent(int fd) {
 #else
   this->stopTimeOut(fd);
 #endif
-  stream->clearStatus(STREAM_STATUS::BCK_READ_PENDING);
+  if(result == IO::IO_RESULT::FULL_BUFFER) {
+    stream->status |= helper::to_underlying(STREAM_STATUS::BCK_READ_PENDING);
+    stream->backend_connection.disableEvents();
+  }else {
+    stream->clearStatus(STREAM_STATUS::BCK_READ_PENDING);
+  }
   if (stream->hasOption(STREAM_OPTION::PINNED_CONNECTION) || stream->response.hasPendingData()) {
 #ifdef CACHE_ENABLED
     if (stream->response.chunked_status != CHUNKED_STATUS::CHUNKED_DISABLED) {
@@ -1387,16 +1276,13 @@ void StreamManager::setStreamBackend(HttpStream* stream) {
 
 void StreamManager::onServerWriteEvent(HttpStream* stream) {
   DEBUG_COUNTER_HIT(debug__::on_send_request);
-  ScopeExit logStream{
-      [stream] { stream->dumpDebugData("onServerWriteEvent"); }};
+  std::string extra_log;
+  ScopeExit logStream{[stream, &extra_log] {
+    stream->dumpDebugData("onServerW", extra_log.data());
+  }};
   auto& listener_config_ = *stream->service_manager->listener_config_;
   // update log info
   StreamDataLogger logger(stream, listener_config_);
-  if (UNLIKELY(stream->backend_connection.isCancelled())) {
-    clearStream(stream);
-    return;
-  }
-  // StreamWatcher watcher(*stream);
   int fd = stream->backend_connection.getFileDescriptor();
   // Send client request to backend server
 #if USE_TIMER_FD_TIMEOUT
@@ -1424,7 +1310,8 @@ void StreamManager::onServerWriteEvent(HttpStream* stream) {
    * , then we need to write the buffer content without
    * applying any kind of modification. */
   IO::IO_RESULT result = IO::IO_RESULT::ERROR;
-  if (stream->upgrade.pinned_connection || stream->request.hasPendingData()) {
+  if (stream->hasOption(STREAM_OPTION::PINNED_CONNECTION)
+      || stream->request.hasPendingData()) {
     size_t written = 0;
 
     if (stream->backend_connection.getBackend()->isHttps()) {
@@ -1440,6 +1327,7 @@ void StreamManager::onServerWriteEvent(HttpStream* stream) {
             stream->backend_connection.getFileDescriptor(), stream->request);
 #endif
     }
+    extra_log = IO::getResultString(result);
     switch (result) {
       case IO::IO_RESULT::SSL_HANDSHAKE_ERROR:
       case IO::IO_RESULT::SSL_NEED_HANDSHAKE: {
@@ -1455,8 +1343,8 @@ void StreamManager::onServerWriteEvent(HttpStream* stream) {
               listener_config_.err503, stream->client_connection);
           clearStream(stream);
         }
-        if (!stream->backend_connection.ssl_connected) {
-          stream->backend_connection.enableReadEvent();
+        if (stream->backend_connection.ssl_connected) {
+          stream->backend_connection.enableWriteEvent();
         }
         return;
       }
@@ -1512,7 +1400,7 @@ void StreamManager::onServerWriteEvent(HttpStream* stream) {
     result = stream->client_connection.writeTo(stream->backend_connection,
                                                stream->request);
   }
-
+  extra_log = IO::getResultString(result);
   switch (result) {
     case IO::IO_RESULT::SSL_HANDSHAKE_ERROR:
     case IO::IO_RESULT::SSL_NEED_HANDSHAKE: {
@@ -1572,6 +1460,8 @@ void StreamManager::onServerWriteEvent(HttpStream* stream) {
       stream->request.message_bytes_left, IO::getResultString(result).data());
 #endif
   Time::getTime(stream->backend_connection.time_start);
+  stream->client_connection.enableReadEvent();
+  stream->backend_connection.enableReadEvent();
   stream->clearStatus(STREAM_STATUS::REQUEST_PENDING);
   if (stream->hasStatus(STREAM_STATUS::CL_READ_PENDING)) {
     Logger::logmsg(
@@ -1585,23 +1475,18 @@ void StreamManager::onServerWriteEvent(HttpStream* stream) {
         stream->backend_connection.getFileDescriptor());
     onRequestEvent(stream->client_connection.getFileDescriptor());
   }
-  stream->client_connection.enableReadEvent();
-  stream->backend_connection.enableReadEvent();
 }
 
 void StreamManager::onClientWriteEvent(HttpStream* stream) {
   if(stream == nullptr) return;
   DEBUG_COUNTER_HIT(debug__::on_send_response);
+  std::string extra_log;
+  const char * dd =  extra_log.data();
   ScopeExit logStream{
-      [stream] { stream->dumpDebugData("onClientWriteEvent"); }};
+      [stream, dd] { stream->dumpDebugData("onClientW",dd); }};
   auto& listener_config_ = *stream->service_manager->listener_config_;
   // update log info
   StreamDataLogger logger(stream, listener_config_);
-
-  if (UNLIKELY(stream->client_connection.isCancelled())) {
-    clearStream(stream);
-    return;
-  }
 
 #if PRINT_DEBUG_FLOW_BUFFERS
   Logger::logmsg(
@@ -1610,8 +1495,6 @@ void StreamManager::onClientWriteEvent(HttpStream* stream) {
       stream->response.message_bytes_left);
   auto buffer_size_in = stream->backend_connection.buffer_size;
 #endif
-  stream->backend_connection.enableReadEvent();
-  stream->client_connection.enableReadEvent();
   IO::IO_RESULT result = IO::IO_RESULT::ERROR;
   /* If the connection is pinned, then we need to write the buffer
    * content without applying any kind of modification. */
@@ -1631,6 +1514,7 @@ void StreamManager::onClientWriteEvent(HttpStream* stream) {
             stream->client_connection.getFileDescriptor(), stream->response);
 #endif
     }
+    extra_log = IO::getResultString(result);
     switch (result) {
       case IO::IO_RESULT::SSL_HANDSHAKE_ERROR:
       case IO::IO_RESULT::SSL_NEED_HANDSHAKE: {
@@ -1644,9 +1528,12 @@ void StreamManager::onClientWriteEvent(HttpStream* stream) {
         if (stream->client_connection.ssl_connected) {
           stream->backend_connection.server_name =
               stream->client_connection.server_name;
+          onRequestEvent(stream->client_connection.getFileDescriptor());
+          return;
         }
         return;
       }
+      case IO::IO_RESULT::ZERO_DATA:
       case IO::IO_RESULT::SUCCESS:
       case IO::IO_RESULT::DONE_TRY_AGAIN:
         break;
@@ -1713,6 +1600,11 @@ void StreamManager::onClientWriteEvent(HttpStream* stream) {
         stream->backend_connection.enableReadEvent();
         stream->client_connection.enableReadEvent();
       }
+    stream->client_connection.enableReadEvent();
+    stream->backend_connection.enableReadEvent();
+    if (stream->hasStatus(STREAM_STATUS::BCK_READ_PENDING)) {
+      onResponseEvent(stream->backend_connection.getFileDescriptor());
+    }
     return;
   }
 
@@ -1731,6 +1623,7 @@ void StreamManager::onClientWriteEvent(HttpStream* stream) {
     result = stream->backend_connection.writeTo(stream->client_connection,
                                                 stream->response);
   }
+  extra_log = IO::getResultString(result);
   switch (result) {
     case IO::IO_RESULT::SSL_HANDSHAKE_ERROR:
     case IO::IO_RESULT::SSL_NEED_HANDSHAKE: {
@@ -1849,10 +1742,6 @@ void StreamManager::onClientWriteEvent(HttpStream* stream) {
       }
     }
   }
-  stream->clearStatus(STREAM_STATUS::RESPONSE_PENDING);
-  if (stream->hasStatus(STREAM_STATUS::BCK_READ_PENDING)) {
-    onResponseEvent(stream->backend_connection.getFileDescriptor());
-  }
 
   if (stream->backend_connection.buffer_size > 0)
     stream->client_connection.enableWriteEvent();
@@ -1866,6 +1755,12 @@ void StreamManager::onClientWriteEvent(HttpStream* stream) {
 #endif
       stream->backend_connection.enableReadEvent();
     stream->client_connection.enableReadEvent();
+  }
+  stream->clearStatus(STREAM_STATUS::RESPONSE_PENDING);
+  if (stream->hasStatus(STREAM_STATUS::BCK_READ_PENDING)) {
+    stream->dumpDebugData("ClientW-ReadPending", "PENDING ");
+    stream->backend_connection.enableReadEvent();
+    onResponseEvent(stream->backend_connection.getFileDescriptor());
   }
 }
 
@@ -1993,6 +1888,7 @@ bool StreamManager::isHandler(ctl::CtlTask& task) {
 void StreamManager::onServerDisconnect(HttpStream* stream) {
   if (stream == nullptr) return;
   DEBUG_COUNTER_HIT(debug__::on_backend_disconnect);
+    stream->dumpDebugData("onServerDisconnect", "DISCONNECT");
   auto& listener_config_ = *stream->service_manager->listener_config_;
   // update log info
   StreamDataLogger logger(stream, listener_config_);
